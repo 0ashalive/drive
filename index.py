@@ -8,21 +8,28 @@ app = Flask(__name__)
 
 STORE_FILE = os.environ.get("PLAYLIST_STORE_FILE", "/tmp/playlists.json")
 
-DEFAULT_PLAYLISTS = {
-    "ottplus": "https://drive.usercontent.google.com/u/0/uc?id=1SJi5LT5bQ1ZHT5eYQM3VOYuNB6U-mYCB&export=download",
+CHROME_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/91.0.4472.124 Safari/537.36"
+)
+
+# Map short IDs to Google Drive file IDs or full URLs
+PLAYLIST_IDS = {
+    "ottplus": "1SJi5LT5bQ1ZHT5eYQM3VOYuNB6U-mYCB",
 }
 
 
-def normalize_drive_url(url: str) -> str:
-    url = url.strip()
-    match = re.search(r"drive\.google\.com/file/d/([a-zA-Z0-9_-]+)", url)
+def extract_file_id_or_url(value: str) -> str:
+    value = value.strip()
+    match = re.search(r"(?:drive\.google\.com/file/d/|id=)([a-zA-Z0-9_-]+)", value)
     if match:
-        return f"https://drive.usercontent.google.com/u/0/uc?id={match.group(1)}&export=download"
-    return url
+        return match.group(1)
+    return value
 
 
-def load_playlists() -> dict:
-    data = dict(DEFAULT_PLAYLISTS)
+def get_all_sources() -> dict:
+    sources = dict(PLAYLIST_IDS)
     env_json = os.environ.get("PLAYLISTS_JSON")
     if env_json:
         try:
@@ -30,7 +37,7 @@ def load_playlists() -> dict:
             if isinstance(parsed, dict):
                 for k, v in parsed.items():
                     if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
-                        data[k.strip().lower()] = normalize_drive_url(v)
+                        sources[k.strip().lower()] = extract_file_id_or_url(v)
         except Exception:
             pass
 
@@ -41,135 +48,94 @@ def load_playlists() -> dict:
                 if isinstance(saved, dict):
                     for k, v in saved.items():
                         if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
-                            data[k.strip().lower()] = normalize_drive_url(v)
+                            sources[k.strip().lower()] = extract_file_id_or_url(v)
         except Exception:
             pass
 
-    return data
+    return sources
 
 
-def save_playlists(playlists: dict) -> None:
+def save_sources(sources: dict) -> None:
     try:
         with open(STORE_FILE, "w", encoding="utf-8") as f:
-            json.dump(playlists, f, indent=2)
+            json.dump(sources, f, indent=2)
     except Exception:
         pass
 
 
-def fetch_m3u_text(url: str) -> str:
-    session = requests.Session()
-    headers = {"User-Agent": "Mozilla/5.0"}
-    res = session.get(url, headers=headers, timeout=20, allow_redirects=True)
-    res.raise_for_status()
-
-    if "text/html" in res.headers.get("Content-Type", "") and "confirm=" in res.text:
-        confirm_match = re.search(r"confirm=([0-9A-Za-z_]+)", res.text)
-        if confirm_match:
-            sep = "&" if "?" in url else "?"
-            res = session.get(
-                f"{url}{sep}confirm={confirm_match.group(1)}",
-                headers=headers,
-                timeout=20,
-                allow_redirects=True,
-            )
-            res.raise_for_status()
-
-    text = res.text.strip()
-    if not text.startswith("#EXTM3U"):
-        text = "#EXTM3U\n" + text
-    return text + "\n"
-
-
-def m3u_text_response(text: str, status: int = 200) -> Response:
+def html_response(body: str, status: int = 200) -> Response:
     return Response(
-        text,
+        body,
         status=status,
-        mimetype="text/plain; charset=utf-8",
-        headers={"Content-Disposition": "inline"},
+        mimetype="text/html",
+        headers={
+            "Content-Type": "text/html; charset=utf-8",
+            "Access-Control-Allow-Origin": "*",
+            "Content-Disposition": "inline",
+        },
     )
 
 
-def render_playlist_by_key(key: str) -> Response:
-    clean_key = key.strip().lower()
-    playlists = load_playlists()
+def fetch_drive_content(source: str) -> str:
+    if source.startswith("http://") or source.startswith("https://"):
+        direct_url = source
+    else:
+        direct_url = f"https://drive.usercontent.google.com/u/0/uc?id={source}&export=download"
 
-    if clean_key == "all":
-        merged = ["#EXTM3U"]
-        for _, url in playlists.items():
-            try:
-                content = fetch_m3u_text(url)
-                for line in content.splitlines():
-                    if not line.strip().startswith("#EXTM3U"):
-                        merged.append(line)
-            except Exception:
-                continue
-        return m3u_text_response("\n".join(merged) + "\n")
+    res = requests.get(
+        direct_url,
+        headers={"User-Agent": CHROME_USER_AGENT},
+        timeout=20,
+        allow_redirects=True,
+    )
+    http_code = res.status_code
 
-    url = playlists.get(clean_key)
-    if not url:
-        available = ", ".join(f"?id={k}" for k in playlists.keys())
-        return m3u_text_response(
-            f"#EXTM3U\n# Playlist not found. Available: {available}\n",
-            status=404,
+    if http_code != 200:
+        return (
+            f"#EXTM3U\n#ERROR: Google Drive denied access (HTTP Code {http_code}). "
+            "Check if the file is public."
         )
 
-    try:
-        content = fetch_m3u_text(url)
-        return m3u_text_response(content)
-    except Exception as e:
-        return m3u_text_response(
-            f"#EXTM3U\n# Error loading '{clean_key}': {e}\n",
-            status=502,
-        )
+    return res.text
 
 
 @app.route("/")
-@app.route("/view")
-def home_or_query_view():
-    playlist_id = request.args.get("id")
-    if playlist_id:
-        return render_playlist_by_key(playlist_id)
+def index():
+    sources = get_all_sources()
+    requested_id = (request.args.get("id") or "").strip().lower()
 
-    playlists = load_playlists()
-    lines = [
-        "#EXTM3U",
-        "# Available Playlists (?id=):",
-        *(f"#   /?id={name}" for name in playlists.keys()),
-        "#   /?id=all",
-    ]
-    return m3u_text_response("\n".join(lines) + "\n")
+    if not requested_id:
+        requested_id = "ottplus" if "ottplus" in sources else next(iter(sources), "")
+
+    if not requested_id or requested_id not in sources:
+        available = ", ".join(f"?id={k}" for k in sources.keys())
+        return html_response(
+            f"#EXTM3U\n#ERROR: Playlist not found. Available: {available}",
+            status=404,
+        )
+
+    data = fetch_drive_content(sources[requested_id])
+    return html_response(data, status=200)
 
 
 @app.route("/add", methods=["GET", "POST"])
-def add_playlist():
+def add_source():
     if request.method == "POST":
         payload = request.get_json(silent=True) or request.form or {}
         name = str(payload.get("name", "")).strip().lower()
-        raw_url = str(payload.get("url", "")).strip()
+        target = str(payload.get("url") or payload.get("id") or "").strip()
     else:
         name = str(request.args.get("name", "")).strip().lower()
-        raw_url = str(request.args.get("url", "")).strip()
+        target = str(request.args.get("url") or request.args.get("id") or "").strip()
 
-    if not name or not raw_url:
-        return jsonify({"error": "Both 'name' and 'url' are required."}), 400
+    if not name or not target:
+        return jsonify({"error": "Both 'name' and 'url' (or 'id') are required."}), 400
 
-    if not re.match(r"^[a-z0-9_-]+$", name) or name in {"add", "all", "view"}:
-        return jsonify({"error": "Invalid 'name'."}), 400
+    sources = get_all_sources()
+    sources[name] = extract_file_id_or_url(target)
+    save_sources(sources)
 
-    playlists = load_playlists()
-    playlists[name] = normalize_drive_url(raw_url)
-    save_playlists(playlists)
-
-    return jsonify({
-        "status": "added",
-        "name": name,
-        "view_url": f"/?id={name}",
-    }), 201
-
-
-@app.route("/<name>")
-def serve_path(name):
-    return render_playlist_by_key(name)
+    return jsonify({"status": "added", "name": name, "view": f"/?id={name}"}), 201
 
 
 if __name__ == "__main__":
