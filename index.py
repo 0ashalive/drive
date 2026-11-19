@@ -56,7 +56,7 @@ def save_playlists(playlists: dict) -> None:
         pass
 
 
-def fetch_m3u_data(url: str) -> str:
+def fetch_m3u_text(url: str) -> str:
     session = requests.Session()
     headers = {"User-Agent": "Mozilla/5.0"}
     res = session.get(url, headers=headers, timeout=20, allow_redirects=True)
@@ -66,7 +66,12 @@ def fetch_m3u_data(url: str) -> str:
         confirm_match = re.search(r"confirm=([0-9A-Za-z_]+)", res.text)
         if confirm_match:
             sep = "&" if "?" in url else "?"
-            res = session.get(f"{url}{sep}confirm={confirm_match.group(1)}", headers=headers, timeout=20, allow_redirects=True)
+            res = session.get(
+                f"{url}{sep}confirm={confirm_match.group(1)}",
+                headers=headers,
+                timeout=20,
+                allow_redirects=True,
+            )
             res.raise_for_status()
 
     text = res.text.strip()
@@ -75,7 +80,7 @@ def fetch_m3u_data(url: str) -> str:
     return text + "\n"
 
 
-def inline_m3u_response(text: str, status: int = 200) -> Response:
+def m3u_text_response(text: str, status: int = 200) -> Response:
     return Response(
         text,
         status=status,
@@ -84,16 +89,55 @@ def inline_m3u_response(text: str, status: int = 200) -> Response:
     )
 
 
+def render_playlist_by_key(key: str) -> Response:
+    clean_key = key.strip().lower()
+    playlists = load_playlists()
+
+    if clean_key == "all":
+        merged = ["#EXTM3U"]
+        for _, url in playlists.items():
+            try:
+                content = fetch_m3u_text(url)
+                for line in content.splitlines():
+                    if not line.strip().startswith("#EXTM3U"):
+                        merged.append(line)
+            except Exception:
+                continue
+        return m3u_text_response("\n".join(merged) + "\n")
+
+    url = playlists.get(clean_key)
+    if not url:
+        available = ", ".join(f"?id={k}" for k in playlists.keys())
+        return m3u_text_response(
+            f"#EXTM3U\n# Playlist not found. Available: {available}\n",
+            status=404,
+        )
+
+    try:
+        content = fetch_m3u_text(url)
+        return m3u_text_response(content)
+    except Exception as e:
+        return m3u_text_response(
+            f"#EXTM3U\n# Error loading '{clean_key}': {e}\n",
+            status=502,
+        )
+
+
 @app.route("/")
-def home():
+@app.route("/view")
+def home_or_query_view():
+    playlist_id = request.args.get("id")
+    if playlist_id:
+        return render_playlist_by_key(playlist_id)
+
     playlists = load_playlists()
     lines = [
         "#EXTM3U",
-        "# Available M3U Endpoints:",
-        *(f"#   /{name}" for name in playlists.keys()),
-        "#   /all",
+        "# Available Playlists (?id=):",
+        *(f"#   /?id={name}" for name in playlists.keys()),
+        "#   /?id=all",
     ]
-    return inline_m3u_response("\n".join(lines) + "\n")
+    return m3u_text_response("\n".join(lines) + "\n")
 
 
 @app.route("/add", methods=["GET", "POST"])
@@ -109,45 +153,23 @@ def add_playlist():
     if not name or not raw_url:
         return jsonify({"error": "Both 'name' and 'url' are required."}), 400
 
-    if not re.match(r"^[a-z0-9_-]+$", name) or name in {"add", "all"}:
+    if not re.match(r"^[a-z0-9_-]+$", name) or name in {"add", "all", "view"}:
         return jsonify({"error": "Invalid 'name'."}), 400
 
     playlists = load_playlists()
     playlists[name] = normalize_drive_url(raw_url)
     save_playlists(playlists)
 
-    return jsonify({"status": "added", "name": name, "view_path": f"/{name}"}), 201
-
-
-@app.route("/all")
-def serve_all():
-    playlists = load_playlists()
-    merged = ["#EXTM3U"]
-    for _, url in playlists.items():
-        try:
-            content = fetch_m3u_data(url)
-            for line in content.splitlines():
-                if not line.strip().startswith("#EXTM3U"):
-                    merged.append(line)
-        except Exception:
-            continue
-    return inline_m3u_response("\n".join(merged) + "\n")
+    return jsonify({
+        "status": "added",
+        "name": name,
+        "view_url": f"/?id={name}",
+    }), 201
 
 
 @app.route("/<name>")
-def serve_playlist(name):
-    key = name.strip().lower()
-    playlists = load_playlists()
-    url = playlists.get(key)
-    if not url:
-        available = ", ".join(f"/{k}" for k in playlists.keys())
-        return inline_m3u_response(f"#EXTM3U\n# Playlist not found. Available: {available}\n", status=404)
-
-    try:
-        content = fetch_m3u_data(url)
-        return inline_m3u_response(content)
-    except Exception as e:
-        return inline_m3u_response(f"#EXTM3U\n# Error loading '{key}': {e}\n", status=502)
+def serve_path(name):
+    return render_playlist_by_key(name)
 
 
 if __name__ == "__main__":
